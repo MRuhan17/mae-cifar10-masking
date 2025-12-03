@@ -205,3 +205,219 @@ if __name__ == "__main__":
     # Test visualization
     visualize_mask(mask, grid_h, grid_w, save_path="mask_pattern.png")
     print("Mask visualization saved to mask_pattern.png")
+
+
+
+
+def block_masking(
+        x: torch.Tensor,
+    mask_ratio: float = 0.75,
+    grid_h: int = 14,
+    grid_w: int = 14,
+    block_h_min: int = 2,
+    block_h_max: int = 8,
+    block_w_min: int = 2,
+    block_w_max: int = 8,
+    seed: int = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Block masking strategy for MAE pretraining.
+    
+    Samples a random rectangular region in patch space and masks all patches
+    within that block. Dynamically adjusts block size to approximately match
+    the target mask_ratio. More representative of real occlusions than random
+    patch masking.
+    
+    Args:
+        x: Input tensor of shape (B, N, C) where:
+            - B: batch size
+            - N: number of patches (grid_h * grid_w)
+            - C: patch embedding dimension
+        mask_ratio: Target proportion of patches to mask [0.0, 1.0]
+        grid_h: Height of patch grid (e.g., 14 for 14x14)
+        grid_w: Width of patch grid (e.g., 14 for 14x14)
+        block_h_min: Minimum block height
+        block_h_max: Maximum block height
+        block_w_min: Minimum block width
+        block_w_max: Maximum block width
+        seed: Random seed for reproducibility
+    
+    Returns:
+        - x_masked: Unmasked patches only, shape (B, N*(1-mask_ratio), C)
+        - mask: Binary mask, shape (B, N) where 1 = masked, 0 = visible
+        - ids_restore: Indices to restore original order, shape (B, N)
+    
+    Example:
+        >>> B, N, C = 32, 196, 768  # 14x14 grid
+        >>> x = torch.randn(B, N, C)
+        >>> x_masked, mask, ids_restore = block_masking(
+        ...     x, mask_ratio=0.75, grid_h=14, grid_w=14
+        ... )
+        >>> print(x_masked.shape)  # (32, ~49, 768)
+        >>> print(f"Actual mask ratio: {mask.sum() / (B * N):.2%}")
+    """
+    B, N, C = x.shape
+    
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+    
+    # Target number of patches to mask per image
+    num_mask_patches = int(N * mask_ratio)
+    
+    # Initialize mask for entire batch
+    mask = torch.zeros([B, grid_h, grid_w], device=x.device)
+    
+    for b in range(B):
+        # Dynamically determine block size to match mask_ratio
+        # Start with maximum block size and iteratively reduce if needed
+        best_block_h, best_block_w = block_h_max, block_w_max
+        min_diff = float('inf')
+        
+        # Try different block sizes to find closest match to mask_ratio
+        for try_h in range(block_h_max, block_h_min - 1, -1):
+            for try_w in range(block_w_max, block_w_min - 1, -1):
+                num_masked = try_h * try_w
+                diff = abs(num_masked - num_mask_patches)
+                
+                if diff < min_diff:
+                    min_diff = diff
+                    best_block_h, best_block_w = try_h, try_w
+        
+        # Sample random top-left corner for the block
+        # Ensure block doesn't exceed grid boundaries
+        max_h_start = max(0, grid_h - best_block_h)
+        max_w_start = max(0, grid_w - best_block_w)
+        
+        h_start = torch.randint(0, max_h_start + 1, (1,)).item()
+        w_start = torch.randint(0, max_w_start + 1, (1,)).item()
+        
+        # Mask the rectangular block
+        h_end = min(h_start + best_block_h, grid_h)
+        w_end = min(w_start + best_block_w, grid_w)
+        
+        mask[b, h_start:h_end, w_start:w_end] = 1
+    
+    # Reshape mask to (B, N)
+    mask = mask.reshape(B, -1)
+    
+    # Create restore indices using noise-based sorting for robustness
+    noise = torch.rand(B, N, device=x.device)
+    # Make masked patches have high noise (will be sorted to end)
+    noise[mask == 1] = noise[mask == 1] + 2.0
+    
+    ids_shuffle = torch.argsort(noise, dim=1)
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+    
+    # Keep unmasked patches (minimum across batch for consistency)
+    len_keep = (mask == 0).sum(dim=1).min().item()
+    ids_keep = ids_shuffle[:, :len_keep]
+    
+    # Gather unmasked patches
+    x_masked = torch.gather(x, 1, ids_keep.unsqueeze(-1).expand(-1, -1, C))
+    
+    return x_masked, mask, ids_restore
+
+def adaptive_block_masking(
+    x: torch.Tensor,
+    mask_ratio: float = 0.75,
+    grid_h: int = 14,
+    grid_w: int = 14,
+    num_blocks: int = 1,
+    seed: int = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Advanced block masking with multiple random blocks per image.
+    
+    Allows masking multiple non-overlapping rectangular regions to achieve
+    more flexible mask ratios. Useful for varying difficulty levels during
+    pretraining.
+    
+    Args:
+        x: Input tensor of shape (B, N, C)
+        mask_ratio: Target proportion of patches to mask
+        grid_h: Height of patch grid
+        grid_w: Width of patch grid
+        num_blocks: Number of rectangular blocks to sample (non-overlapping)
+        seed: Random seed for reproducibility
+    
+    Returns:
+        - x_masked: Unmasked patches
+        - mask: Binary mask indicating masked patches
+        - ids_restore: Restore indices
+    
+    Example:
+        >>> x_masked, mask, ids_restore = adaptive_block_masking(
+        ...     x, mask_ratio=0.75, grid_h=14, grid_w=14, num_blocks=2
+        ... )
+    """
+    B, N, C = x.shape
+    
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+    
+    # Initialize mask
+    mask = torch.zeros([B, grid_h, grid_w], device=x.device)
+    num_mask_patches = int(N * mask_ratio)
+    
+    for b in range(B):
+        # Target patches per block
+        patches_per_block = num_mask_patches // num_blocks
+        
+        # Sample multiple blocks
+        occupied = torch.zeros([grid_h, grid_w], device=x.device)
+        
+        for block_idx in range(num_blocks):
+            # Try to find valid region
+            max_attempts = 10
+            placed = False
+            
+            for attempt in range(max_attempts):
+                # Random block size (approximately square)
+                block_size = int(np.sqrt(patches_per_block))
+                block_h = torch.randint(max(1, block_size // 2), block_size + 2, (1,)).item()
+                block_w = torch.randint(max(1, block_size // 2), block_size + 2, (1,)).item()
+                
+                # Random position
+                max_h_start = max(1, grid_h - block_h)
+                max_w_start = max(1, grid_w - block_w)
+                h_start = torch.randint(0, max_h_start, (1,)).item()
+                w_start = torch.randint(0, max_w_start, (1,)).item()
+                
+                h_end = min(h_start + block_h, grid_h)
+                w_end = min(w_start + block_w, grid_w)
+                
+                # Check for overlap
+                region = occupied[h_start:h_end, w_start:w_end]
+                if region.sum() == 0:  # No overlap
+                    mask[b, h_start:h_end, w_start:w_end] = 1
+                    occupied[h_start:h_end, w_start:w_end] = 1
+                    placed = True
+                    break
+            
+            if not placed and attempt == max_attempts - 1:
+                # Fallback: place block anyway (allow overlap)
+                block_h = max(1, block_size // 2)
+                block_w = max(1, block_size // 2)
+                h_start = torch.randint(0, max(1, grid_h - block_h), (1,)).item()
+                w_start = torch.randint(0, max(1, grid_w - block_w), (1,)).item()
+                h_end = min(h_start + block_h, grid_h)
+                w_end = min(w_start + block_w, grid_w)
+                mask[b, h_start:h_end, w_start:w_end] = 1
+    
+    # Reshape and create restore indices
+    mask = mask.reshape(B, -1)
+    
+    noise = torch.rand(B, N, device=x.device)
+    noise[mask == 1] = noise[mask == 1] + 2.0
+    
+    ids_shuffle = torch.argsort(noise, dim=1)
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+    
+    len_keep = (mask == 0).sum(dim=1).min().item()
+    ids_keep = ids_shuffle[:, :len_keep]
+    
+    x_masked = torch.gather(x, 1, ids_keep.unsqueeze(-1).expand(-1, -1, C))
+    
+    return x_masked, mask, ids_restore
